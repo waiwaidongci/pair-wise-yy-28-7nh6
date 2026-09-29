@@ -24,6 +24,7 @@ class Handler(BaseHTTPRequestHandler):
                 data=(BASE/"static"/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data); return
             if p.path=="/api/state": return self._json(200,self.db.snapshot())
             if len(parts)==4 and parts[:2]==["api","productions"] and parts[3]=="continuity": return self._json(200,self.db.continuity_report(int(parts[2])))
+            if len(parts)==4 and parts[:2]==["api","productions"] and parts[3]=="conflicts": return self._json(200,{"conflicts":self.db.list_production_conflicts(int(parts[2]),"all" in parse_qs(p.query))})
             if len(parts)==4 and parts[:2]==["api","scenes"] and parts[3]=="conflicts": return self._json(200,{"conflicts":self.db.list_conflicts(int(parts[2]),True)})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
@@ -37,6 +38,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","productions"] and parts[3]=="elements": return self._json(201,{"ok":True,"id":self.db.add_element(int(parts[2]),str(b.get("name","")),str(b.get("kind","prop")),str(b.get("rule","stable")),str(b.get("description","")))})
             if len(parts)==4 and parts[:2]==["api","scenes"] and parts[3]=="shots": return self._json(201,{"ok":True,"id":self.db.add_shot(int(parts[2]),str(b.get("shot_code","")),int(b.get("shoot_order",0)),int(b.get("narrative_order",0)),str(b.get("description","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","scenes"] and parts[3]=="check": return self._json(200,{"ok":True,"conflicts":self.db.check_scene(int(parts[2]))})
+            if len(parts)==4 and parts[:2]==["api","productions"] and parts[3]=="check": return self._json(200,{"ok":True,"conflicts":self.db.check_production(int(parts[2]))})
+            if len(parts)==4 and parts[:2]==["api","scenes"] and parts[3]=="reorder": return self._json(200,{"ok":True,"conflicts":self.db.reorder_scene(int(parts[2]),int(b.get("narrative_order",0)),int(b.get("user_id",0)))})
+            if len(parts)==4 and parts[:2]==["api","shots"] and parts[3]=="reorder": return self._json(200,{"ok":True,"conflicts":self.db.reorder_shot(int(parts[2]),int(b.get("narrative_order",0)),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","shots"] and parts[3]=="states": return self._json(200,{"ok":True,**self.db.set_element_state(int(parts[2]),int(b.get("element_id",0)),str(b.get("state_value","")),b.get("numeric_value"),str(b.get("note","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","shots"] and parts[3]=="lock": self.db.lock_shot(int(parts[2]),int(b.get("user_id",0))); return self._json(200,{"ok":True})
             if len(parts)==4 and parts[:2]==["api","elements"] and parts[3]=="transitions": return self._json(201,{"ok":True,"id":self.db.add_transition(int(parts[2]),str(b.get("from_state","")),str(b.get("to_state","")),str(b.get("note","")))})
