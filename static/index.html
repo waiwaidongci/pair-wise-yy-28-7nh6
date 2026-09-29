@@ -1,1 +1,135 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>影视拍摄连续性</title><style>body{font:15px system-ui;max-width:1100px;margin:24px auto;padding:0 16px;background:#f3f4f7}section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}input,textarea,select,button{padding:7px;margin:3px;border:1px solid #aaa;border-radius:6px}button{background:#4b2d6f;color:#fff}pre{white-space:pre-wrap;max-height:420px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input,.grid textarea{width:90%}</style><h1>影视拍摄连续性管理</h1><section><h2>连续性报告</h2><input id="production" type="number" placeholder="项目 ID"><button onclick="report()">查看报告</button><pre id="state"></pre></section><section><h2>状态与冲突</h2><div class="grid"><input id="scene" type="number" placeholder="场次 ID"><input id="shot" type="number" placeholder="镜头 ID"><input id="element" type="number" placeholder="元素 ID"><input id="user" type="number" placeholder="场记/制片 ID"><input id="value" placeholder="状态值"><input id="numeric" type="number" step="0.1" placeholder="数值"><input id="conflict" type="number" placeholder="冲突 ID"><input id="reviewer" type="number" placeholder="审片人 ID"><input id="reason" placeholder="理由"></div><button onclick="state()">设置状态并检测</button><button onclick="check()">重新检查场次</button><button onclick="lock()">锁定镜头</button><button onclick="exempt()">批准豁免</button><pre id="result"></pre></section><section><h2>调整方案</h2><input id="newvalue" placeholder="新状态"><input id="newnumeric" type="number" step="0.1" placeholder="新数值"><button onclick="propose()">提出方案</button><input id="plan" type="number" placeholder="方案 ID"><button onclick="approve()">批准方案</button><pre id="extra"></pre></section><script>const show=(e,x)=>document.querySelector(e).textContent=JSON.stringify(x,null,2);async function get(u,e='#result'){show(e,await(await fetch(u)).json())}async function post(u,b,e='#result'){show(e,await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}function report(){get('/api/productions/'+production.value+'/continuity','#state')}function state(){post('/api/shots/'+shot.value+'/states',{element_id:+element.value,state_value:value.value,numeric_value:numeric.value?+numeric.value:null,note:reason.value,user_id:+user.value})}function check(){post('/api/scenes/'+scene.value+'/check',{})}function lock(){post('/api/shots/'+shot.value+'/lock',{user_id:+user.value})}function exempt(){post('/api/conflicts/'+conflict.value+'/exemptions',{reason:reason.value,reviewer_id:+reviewer.value})}function propose(){post('/api/conflicts/'+conflict.value+'/plans',{new_value:newvalue.value,numeric_value:newnumeric.value?+newnumeric.value:null,reason:reason.value,user_id:+user.value})}function approve(){post('/api/plans/'+plan.value+'/review',{approve:true,reviewer_id:+reviewer.value,note:reason.value},'#extra')}report()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>影视拍摄连续性</title><style>
+body{font:15px system-ui;max-width:1180px;margin:24px auto;padding:0 16px;background:#f3f4f7}
+section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}
+input,textarea,select,button{padding:7px;margin:3px;border:1px solid #aaa;border-radius:6px}
+button{background:#4b2d6f;color:#fff;cursor:pointer}
+button.secondary{background:#5b6472}
+pre{white-space:pre-wrap;max-height:420px;overflow:auto}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.grid input,.grid textarea{width:90%}
+.chain{border-collapse:collapse;width:100%;font-size:13px}
+.chain th,.chain td{border:1px solid #ddd;padding:5px 8px;text-align:left;vertical-align:top}
+.chain th{background:#efeaf6}
+.scene-row td{background:#e7e2f2;font-weight:600}
+.inherited{color:#7a6a3a;background:#fdf6dd;border-radius:4px;padding:0 4px}
+.explicit{color:#23502e;background:#e7f6ec;border-radius:4px;padding:0 4px}
+.cross{color:#8a1f1f;background:#fbe6e6;border-radius:4px;padding:1px 5px;font-weight:600}
+.bad{color:#b4231f;font-weight:600}.ok{color:#2c7a43;font-weight:600}.muted{color:#777}
+.tag{font-size:12px;border-radius:4px;padding:0 5px}
+.tag.open{background:#fbe6e6;color:#8a1f1f}.tag.exempted{background:#fff1d6;color:#8a5a00}.tag.resolved{background:#e7f6ec;color:#23502e}
+</style>
+<h1>影视拍摄连续性管理</h1>
+
+<section>
+  <h2>全片连续性（按叙事顺序跨场次检查）</h2>
+  <input id="production" type="number" placeholder="项目 ID">
+  <button onclick="report()">查看全片报告</button>
+  <button class="secondary" onclick="checkAll()">全片重新检查</button>
+  <span id="summary" class="muted"></span>
+  <div id="crossBox" style="margin-top:10px"></div>
+  <div style="overflow:auto;margin-top:10px"><table class="chain" id="chain"></table></div>
+  <details style="margin-top:8px"><summary>原始 JSON</summary><pre id="state"></pre></details>
+</section>
+
+<section>
+  <h2>单场 / 镜头操作（保留）</h2>
+  <div class="grid">
+    <input id="scene" type="number" placeholder="场次 ID">
+    <input id="shot" type="number" placeholder="镜头 ID">
+    <input id="element" type="number" placeholder="元素 ID">
+    <input id="user" type="number" placeholder="场记/制片 ID">
+    <input id="value" placeholder="状态值">
+    <input id="numeric" type="number" step="0.1" placeholder="数值（单调规则必填）">
+    <input id="conflict" type="number" placeholder="冲突 ID">
+    <input id="reviewer" type="number" placeholder="审片人 ID">
+    <input id="reason" placeholder="理由 / 备注">
+  </div>
+  <button onclick="state()">设置状态并全片检测</button>
+  <button onclick="check()">重新检查单场</button>
+  <button onclick="lock()">锁定镜头</button>
+  <button onclick="exempt()">批准豁免</button>
+  <pre id="result"></pre>
+</section>
+
+<section>
+  <h2>调整方案（冲突 → 调整或豁免，复核后更新报告与锁定结果）</h2>
+  <input id="newvalue" placeholder="新状态">
+  <input id="newnumeric" type="number" step="0.1" placeholder="新数值">
+  <button onclick="propose()">提出方案</button>
+  <input id="plan" type="number" placeholder="方案 ID">
+  <button onclick="approve()">批准方案</button>
+  <pre id="extra"></pre>
+</section>
+
+<section>
+  <h2>叙事顺序调整（场次 / 镜头改序后旧冲突自动失效重挂）</h2>
+  <input id="reorderId" type="number" placeholder="场次 ID 或镜头 ID">
+  <input id="reorderOrder" type="number" placeholder="新叙事顺序">
+  <input id="reorderUser" type="number" placeholder="场记/制片 ID">
+  <button onclick="reorderScene()">改场次顺序</button>
+  <button onclick="reorderShot()">改镜头顺序</button>
+  <pre id="reorderOut"></pre>
+</section>
+
+<script>
+const show=(e,x)=>document.querySelector(e).textContent=JSON.stringify(x,null,2);
+async function get(u,e='#result'){show(e,await(await fetch(u)).json())}
+async function post(u,b,e='#result'){show(e,await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function state(){post('/api/shots/'+shot.value+'/states',{element_id:+element.value,state_value:value.value,numeric_value:numeric.value?+numeric.value:null,note:reason.value,user_id:+user.value}).then(()=>report())}
+function check(){post('/api/scenes/'+scene.value+'/check',{}).then(()=>report())}
+function lock(){post('/api/shots/'+shot.value+'/lock',{user_id:+user.value})}
+function exempt(){post('/api/conflicts/'+conflict.value+'/exemptions',{reason:reason.value,reviewer_id:+reviewer.value}).then(()=>report())}
+function propose(){post('/api/conflicts/'+conflict.value+'/plans',{new_value:newvalue.value,numeric_value:newnumeric.value?+newnumeric.value:null,reason:reason.value,user_id:+user.value})}
+function approve(){post('/api/plans/'+plan.value+'/review',{approve:true,reviewer_id:+reviewer.value,note:reason.value},'#extra').then(()=>report())}
+function checkAll(){post('/api/productions/'+production.value+'/check',{},'#result').then(()=>report())}
+function reorderScene(){post('/api/scenes/'+reorderId.value+'/reorder',{narrative_order:+reorderOrder.value,user_id:+reorderUser.value},'#reorderOut').then(()=>report())}
+function reorderShot(){post('/api/shots/'+reorderId.value+'/reorder',{narrative_order:+reorderOrder.value,user_id:+reorderUser.value},'#reorderOut').then(()=>report())}
+
+function stateCell(st){
+  const cls=st.source==='inherited'?'inherited':'explicit';
+  const label=st.source==='inherited'?'沿用':'人工';
+  const src=st.source==='inherited'?`（沿自镜头 #${st.source_shot_id}）`:'';
+  const num=st.numeric_value!=null?` [${st.numeric_value}]`:'';
+  return `<span class="${cls}">${label}</span> ${esc(st.state_value)}${num} <span class="muted">${esc(src)}</span>`;
+}
+
+function renderCross(data){
+  const cs=data.cross_scene_conflicts||[];
+  if(!cs.length){crossBox.innerHTML='<span class="ok">无跨场次冲突</span>';return}
+  crossBox.innerHTML='<div class="bad">跨场次冲突 '+cs.length+' 个：</div><table class="chain"><tr><th>ID</th><th>类型</th><th>元素</th><th>前一镜</th><th>后一镜</th><th>说明</th><th>状态</th></tr>'
+    +cs.map(c=>`<tr><td>${c.id}</td><td>${esc(c.kind)}</td><td>${esc(c.element_name)}</td>
+      <td>${esc(c.from_scene_number)} / ${esc(c.from_shot_code)} #${c.from_shot_id}</td>
+      <td>${esc(c.to_scene_number)} / ${esc(c.to_shot_code)} #${c.to_shot_id}</td>
+      <td>${esc(c.detail)}</td><td><span class="tag ${c.status}">${c.status}</span>${c.active?'':' (失效)'}</td></tr>`).join('')+'</table>';
+}
+
+function renderChain(data){
+  const rows=['<tr><th>叙事序</th><th>场次</th><th>镜头（拍摄序）</th><th>元素状态（人工值优先；未写则沿用上一镜最近状态）</th><th>镜头</th></tr>'];
+  let lastScene=null;
+  for(const sh of data.narrative_chain||[]){
+    if(lastScene!==sh.scene_id){
+      const sc=(data.scenes||[]).find(s=>s.id===sh.scene_id);
+      rows.push(`<tr class="scene-row"><td colspan="5">场次 ${esc(sh.scene_number)} ${esc(sh.scene_title||(sc&&sc.title)||'')}（叙事序 ${sh.scene_order}）</td></tr>`);
+      lastScene=sh.scene_id;
+    }
+    const states=(sh.states||[]).map(stateCell).join('<br>')||'<span class="muted">暂无状态</span>';
+    rows.push(`<tr><td>${sh.scene_order}-${sh.narrative_order}</td><td>${esc(sh.scene_number)}</td>
+      <td>${esc(sh.shot_code)} <span class="muted">(拍${sh.shoot_order})</span><br><span class="muted">${esc(sh.description||'')}</span></td>
+      <td>${states}</td><td>${sh.status==='locked'?'<span class="tag resolved">已锁定</span>':'<span class="muted">计划中</span>'}</td></tr>`);
+  }
+  document.querySelector('#chain').innerHTML=rows.join('');
+}
+
+function report(){
+  fetch('/api/productions/'+production.value+'/continuity').then(r=>r.json()).then(data=>{
+    show('#state',data);
+    if(data.error){document.querySelector('#summary').innerHTML='<span class="bad">'+esc(data.error)+'</span>';crossBox.innerHTML='';document.querySelector('#chain').innerHTML='';return}
+    document.querySelector('#summary').innerHTML=
+      `全片：<span class="${data.open_conflicts?'bad':'ok'}">未处理冲突 ${data.open_conflicts}</span> ｜ 已豁免 ${data.exempted_conflicts}`;
+    renderCross(data);renderChain(data);
+  });
+}
+report();
+</script></html>

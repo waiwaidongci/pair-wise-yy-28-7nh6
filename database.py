@@ -115,10 +115,13 @@ class ContinuityDB:
               detail TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','exempted','resolved')),
               active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+              cross_scene INTEGER NOT NULL DEFAULT 0 CHECK(cross_scene IN (0,1)),
               fingerprint TEXT NOT NULL UNIQUE,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_conflicts_element ON conflicts(element_id,active);
+            CREATE INDEX IF NOT EXISTS idx_conflicts_scene ON conflicts(scene_id,active);
             CREATE TABLE IF NOT EXISTS adjustment_plans (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               conflict_id INTEGER NOT NULL UNIQUE REFERENCES conflicts(id),
@@ -143,6 +146,9 @@ class ContinuityDB:
             );
             """
         )
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(conflicts)").fetchall()}
+        if "cross_scene" not in cols:
+            self.conn.execute("ALTER TABLE conflicts ADD COLUMN cross_scene INTEGER NOT NULL DEFAULT 0")
         self.conn.commit()
 
     def seed_demo(self) -> None:
@@ -152,13 +158,20 @@ class ContinuityDB:
         continuity = self.add_user("场记", "continuity")
         reviewer = self.add_user("审片", "reviewer")
         production = self.create_production("雨夜追踪", "非线性拍摄出的连续性示例", producer)
-        scene = self.add_scene(production, "S01", "巷口相遇", 1)
-        s01 = self.add_shot(scene, "S01-01", 2, 1, "角色受伤后", continuity)
-        s02 = self.add_shot(scene, "S01-02", 1, 2, "角色尚未受伤", continuity)
+        scene1 = self.add_scene(production, "S01", "巷口相遇", 1)
+        scene2 = self.add_scene(production, "S02", "雨夜追逃", 2)
+        s01 = self.add_shot(scene1, "S01-01", 2, 1, "角色受伤后", continuity)
+        s02 = self.add_shot(scene1, "S01-02", 1, 2, "角色尚未受伤", continuity)
+        s03 = self.add_shot(scene2, "S02-01", 3, 3, "追逃中伤势继续加重", continuity)
         injury = self.add_element(production, "主角左臂伤痕", "injury", "monotonic", "伤痕严重程度只能递增")
+        costume = self.add_element(production, "主角风衣", "costume", "stable", "风衣状态跨场次必须保持")
         self.set_element_state(s01, injury, "重度", 3, "", continuity)
         self.set_element_state(s02, injury, "轻度", 1, "", continuity)
-        self.check_scene(scene)
+        # S02-01 的伤痕未人工记录，沿用上一镜 S01-02 的“轻度”；风衣从整洁变沾泥形成跨场次提醒
+        self.set_element_state(s01, costume, "整洁", None, "", continuity)
+        self.set_element_state(s03, costume, "沾泥", None, "", continuity)
+        self.set_element_state(s03, injury, "重度", 3, "", continuity)
+        self.check_production(production)
 
     def add_user(self, name: str, role: str) -> int:
         if not name.strip() or role not in {"producer", "continuity", "reviewer"}:
@@ -284,94 +297,175 @@ class ContinuityDB:
                     (state_value.strip(), numeric_value, note.strip(), user_id, datetime.now().isoformat(), shot_id, element_id),
                 )
             self.conn.execute("UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
-            self._sync_conflicts(shot["scene_id"])
-        return {"shot_id": shot_id, "element_id": element_id, "conflicts": self.list_conflicts(shot["scene_id"])}
+            self._sync_production(shot["production_id"])
+        return {
+            "shot_id": shot_id,
+            "element_id": element_id,
+            "conflicts": self.list_conflicts(shot["scene_id"]),
+            "production_conflicts": self.list_production_conflicts(shot["production_id"]),
+        }
 
-    def _detect_conflicts(self, scene_id: int) -> list[dict]:
-        scene = self.conn.execute("SELECT * FROM scenes WHERE id=?", (scene_id,)).fetchone()
-        if not scene:
-            raise DomainError("场次不存在")
-        shots = self.conn.execute(
-            "SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene_id,)
+    def _narrative_chain(self, production_id: int) -> list[sqlite3.Row]:
+        """全片镜头按 (场次叙事顺序, 镜头叙事顺序) 串成一条链，与拍摄/剪辑顺序无关。"""
+        return self.conn.execute(
+            "SELECT sh.*, sc.scene_number, sc.title AS scene_title, sc.narrative_order AS scene_order "
+            "FROM shots sh JOIN scenes sc ON sc.id=sh.scene_id "
+            "WHERE sc.production_id=? "
+            "ORDER BY sc.narrative_order, sh.narrative_order, sh.id",
+            (production_id,),
         ).fetchall()
-        elements = self.conn.execute("SELECT * FROM elements WHERE production_id=? ORDER BY id", (scene["production_id"],)).fetchall()
+
+    def _detect_production_conflicts(self, production_id: int) -> list[dict]:
+        """沿全片叙事链逐镜检查：元素未写新状态时沿用上一镜最近的人工/审批状态。
+
+        继承只用于比较与报告，绝不写入 element_states，因此人工写下的值不会被覆盖。
+        """
+        if not self.conn.execute("SELECT 1 FROM productions WHERE id=?", (production_id,)).fetchone():
+            raise DomainError("项目不存在")
+        shots = self._narrative_chain(production_id)
+        elements = self.conn.execute(
+            "SELECT * FROM elements WHERE production_id=? ORDER BY id", (production_id,)
+        ).fetchall()
+        states = {
+            (r["shot_id"], r["element_id"]): r
+            for r in self.conn.execute(
+                "SELECT st.* FROM element_states st JOIN shots sh ON sh.id=st.shot_id JOIN scenes sc ON sc.id=sh.scene_id "
+                "WHERE sc.production_id=?", (production_id,)
+            ).fetchall()
+        }
         detected: list[dict] = []
         for element in elements:
-            sequence = []
+            last: tuple[sqlite3.Row, sqlite3.Row] | None = None  # (shot, state) 最近一次显式状态
             for shot in shots:
-                state = self.conn.execute(
-                    "SELECT * FROM element_states WHERE shot_id=? AND element_id=?", (shot["id"], element["id"])
-                ).fetchone()
-                if state:
-                    sequence.append((shot, state))
-            for (prev_shot, prev), (shot, current) in zip(sequence, sequence[1:]):
-                kind = None
-                detail = ""
-                if element["rule"] == "stable":
-                    if current["state_value"] != prev["state_value"]:
-                        kind = "state_changed"
-                        detail = f"{element['name']} 应为稳定状态，却从 {prev['state_value']} 变为 {current['state_value']}"
-                elif element["rule"] == "monotonic":
-                    if current["numeric_value"] is None or prev["numeric_value"] is None:
-                        kind = "missing_numeric_value"
-                        detail = f"{element['name']} 缺少可比较的数值"
-                    elif current["numeric_value"] < prev["numeric_value"]:
-                        kind = "regression"
-                        detail = f"{element['name']} 在叙事顺序中从 {prev['numeric_value']} 回退到 {current['numeric_value']}"
-                else:
-                    allowed = self.conn.execute(
-                        "SELECT 1 FROM element_transitions WHERE element_id=? AND from_state=? AND to_state=?",
-                        (element["id"], prev["state_value"], current["state_value"]),
-                    ).fetchone()
-                    if not allowed:
-                        kind = "transition_not_allowed"
-                        detail = f"{element['name']} 不允许从 {prev['state_value']} 变为 {current['state_value']}"
-                if kind:
-                    fingerprint = f"{scene_id}:{element['id']}:{prev_shot['id']}:{shot['id']}:{kind}"
-                    detected.append({
-                        "scene_id": scene_id, "element_id": element["id"], "element_name": element["name"],
-                        "from_shot_id": prev_shot["id"], "to_shot_id": shot["id"], "kind": kind,
-                        "detail": detail, "fingerprint": fingerprint,
-                    })
+                current = states.get((shot["id"], element["id"]))
+                if current is None:
+                    continue  # 本镜未记录：沿用上一镜最近状态，不产生冲突
+                if last is not None:
+                    prev_shot, prev = last
+                    kind, detail = self._compare_states(element, prev, current)
+                    if kind:
+                        cross_scene = 1 if prev_shot["scene_id"] != shot["scene_id"] else 0
+                        where = "跨场次" if cross_scene else f"场次 {shot['scene_number']}"
+                        detail = f"[{where}] " + detail
+                        detected.append({
+                            "scene_id": shot["scene_id"],  # 归属到“后一镜”所在场次，单场操作仍能看到
+                            "element_id": element["id"],
+                            "from_shot_id": prev_shot["id"],
+                            "to_shot_id": shot["id"],
+                            "kind": kind,
+                            "detail": detail,
+                            "cross_scene": cross_scene,
+                            "fingerprint": f"{element['id']}:{prev_shot['id']}:{shot['id']}:{kind}",
+                        })
+                last = (shot, current)
         return detected
 
-    def _sync_conflicts(self, scene_id: int) -> None:
-        detected = self._detect_conflicts(scene_id)
-        active_fingerprints = {row["fingerprint"] for row in detected}
-        for row in self.conn.execute("SELECT * FROM conflicts WHERE scene_id=? AND active=1", (scene_id,)).fetchall():
-            if row["fingerprint"] not in active_fingerprints:
-                self.conn.execute(
-                    "UPDATE conflicts SET active=0,status='resolved',updated_at=? WHERE id=?",
-                    (datetime.now().isoformat(), row["id"]),
-                )
+    def _compare_states(self, element: sqlite3.Row, prev: sqlite3.Row,
+                        current: sqlite3.Row) -> tuple[str | None, str]:
+        name = element["name"]
+        if element["rule"] == "stable":
+            if current["state_value"] != prev["state_value"]:
+                return "state_changed", f"{name} 应为稳定状态，却从 {prev['state_value']} 变为 {current['state_value']}"
+        elif element["rule"] == "monotonic":
+            if current["numeric_value"] is not None and prev["numeric_value"] is not None:
+                if current["numeric_value"] < prev["numeric_value"]:
+                    return "regression", f"{name} 在叙事顺序中从 {prev['numeric_value']} 回退到 {current['numeric_value']}"
+        else:
+            allowed = self.conn.execute(
+                "SELECT 1 FROM element_transitions WHERE element_id=? AND from_state=? AND to_state=?",
+                (element["id"], prev["state_value"], current["state_value"]),
+            ).fetchone()
+            if not allowed:
+                return "transition_not_allowed", f"{name} 不允许从 {prev['state_value']} 变为 {current['state_value']}"
+        return None, ""
+
+    def _sync_production(self, production_id: int) -> None:
+        """按当前全片叙事链重建冲突：消失的指纹（含顺序变化导致的错位）一律失效。"""
+        detected = self._detect_production_conflicts(production_id)
+        active_fingerprints = {issue["fingerprint"] for issue in detected}
+        scene_ids = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM scenes WHERE production_id=?", (production_id,))]
+        if scene_ids:
+            placeholders = ",".join("?" for _ in scene_ids)
+            for row in self.conn.execute(
+                f"SELECT * FROM conflicts WHERE scene_id IN ({placeholders}) AND active=1", scene_ids
+            ).fetchall():
+                if row["fingerprint"] not in active_fingerprints:
+                    self.conn.execute(
+                        "UPDATE conflicts SET active=0,status='resolved',updated_at=? WHERE id=?",
+                        (datetime.now().isoformat(), row["id"]),
+                    )
         for issue in detected:
-            existing = self.conn.execute("SELECT * FROM conflicts WHERE fingerprint=?", (issue["fingerprint"],)).fetchone()
+            existing = self.conn.execute(
+                "SELECT * FROM conflicts WHERE fingerprint=?", (issue["fingerprint"],)
+            ).fetchone()
             if existing:
+                # 顺序变化后旧指纹已失效；同一位置指纹重现时复用其豁免结论
                 status = "exempted" if existing["status"] == "exempted" else "open"
                 self.conn.execute(
-                    "UPDATE conflicts SET active=1,status=?,detail=?,updated_at=? WHERE id=?",
-                    (status, issue["detail"], datetime.now().isoformat(), existing["id"]),
+                    "UPDATE conflicts SET active=1,status=?,scene_id=?,cross_scene=?,detail=?,updated_at=? WHERE id=?",
+                    (status, issue["scene_id"], issue["cross_scene"], issue["detail"],
+                     datetime.now().isoformat(), existing["id"]),
                 )
             else:
                 self.conn.execute(
-                    "INSERT INTO conflicts(scene_id,element_id,from_shot_id,to_shot_id,kind,detail,status,active,fingerprint,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?, 'open',1,?,?,?)",
-                    (issue["scene_id"], issue["element_id"], issue["from_shot_id"], issue["to_shot_id"], issue["kind"], issue["detail"], issue["fingerprint"], datetime.now().isoformat(), datetime.now().isoformat()),
+                    "INSERT INTO conflicts(scene_id,element_id,from_shot_id,to_shot_id,kind,detail,status,active,cross_scene,fingerprint,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,'open',1,?,?,?,?)",
+                    (issue["scene_id"], issue["element_id"], issue["from_shot_id"], issue["to_shot_id"],
+                     issue["kind"], issue["detail"], issue["cross_scene"], issue["fingerprint"],
+                     datetime.now().isoformat(), datetime.now().isoformat()),
                 )
 
     def check_scene(self, scene_id: int) -> list[dict]:
-        if not self.conn.execute("SELECT 1 FROM scenes WHERE id=?", (scene_id,)).fetchone():
+        """单场复核：仍按全片叙事链重检，返回本场（含归属本场的跨场次）活跃冲突。"""
+        scene = self.conn.execute("SELECT production_id FROM scenes WHERE id=?", (scene_id,)).fetchone()
+        if not scene:
             raise DomainError("场次不存在")
         with self.transaction():
-            self._sync_conflicts(scene_id)
+            self._sync_production(scene["production_id"])
         return self.list_conflicts(scene_id)
 
-    def list_conflicts(self, scene_id: int, include_resolved: bool = False) -> list[dict]:
-        clause = "" if include_resolved else "AND c.active=1"
+    def check_production(self, production_id: int) -> list[dict]:
+        """全片入口：按全片叙事顺序检查所有场次与镜头。"""
+        if not self.conn.execute("SELECT 1 FROM productions WHERE id=?", (production_id,)).fetchone():
+            raise DomainError("项目不存在")
+        with self.transaction():
+            self._sync_production(production_id)
+        return self.list_production_conflicts(production_id)
+
+    _CONFLICT_SELECT = (
+        "SELECT c.*,e.name AS element_name,"
+        "fs.shot_code AS from_shot_code,ts.shot_code AS to_shot_code,"
+        "fsc.scene_number AS from_scene_number,tsc.scene_number AS to_scene_number "
+        "FROM conflicts c JOIN elements e ON e.id=c.element_id "
+        "JOIN shots fs ON fs.id=c.from_shot_id JOIN shots ts ON ts.id=c.to_shot_id "
+        "JOIN scenes fsc ON fsc.id=fs.scene_id JOIN scenes tsc ON tsc.id=ts.scene_id "
+    )
+
+    def list_conflicts(self, scene_id: int, include_resolved: bool = False,
+                       cross_scene: bool | None = None) -> list[dict]:
+        clauses = ["c.scene_id=?"]
+        params: list = [scene_id]
+        if not include_resolved:
+            clauses.append("c.active=1")
+        if cross_scene is not None:
+            clauses.append("c.cross_scene=?")
+            params.append(1 if cross_scene else 0)
         return [dict(row) for row in self.conn.execute(
-            "SELECT c.*,e.name AS element_name,fs.shot_code AS from_shot_code,ts.shot_code AS to_shot_code "
-            "FROM conflicts c JOIN elements e ON e.id=c.element_id JOIN shots fs ON fs.id=c.from_shot_id JOIN shots ts ON ts.id=c.to_shot_id "
-            f"WHERE c.scene_id=? {clause} ORDER BY c.id", (scene_id,)
+            self._CONFLICT_SELECT + "WHERE " + " AND ".join(clauses) + " ORDER BY c.id", params
+        ).fetchall()]
+
+    def list_production_conflicts(self, production_id: int, include_resolved: bool = False,
+                                  cross_scene: bool | None = None) -> list[dict]:
+        clauses = ["e.production_id=?"]
+        params: list = [production_id]
+        if not include_resolved:
+            clauses.append("c.active=1")
+        if cross_scene is not None:
+            clauses.append("c.cross_scene=?")
+            params.append(1 if cross_scene else 0)
+        return [dict(row) for row in self.conn.execute(
+            self._CONFLICT_SELECT + "WHERE " + " AND ".join(clauses) + " ORDER BY c.id", params
         ).fetchall()]
 
     def propose_adjustment(self, conflict_id: int, new_value: str, numeric_value: float | None,
@@ -410,9 +504,15 @@ class ContinuityDB:
         plan = self.conn.execute("SELECT * FROM adjustment_plans WHERE id=?", (plan_id,)).fetchone()
         if not plan or plan["status"] != "pending":
             raise DomainError("调整方案不存在或已审核")
+        conflict = self.conn.execute("SELECT * FROM conflicts WHERE id=?", (plan["conflict_id"],)).fetchone()
+        if not conflict or not conflict["active"]:
+            raise DomainError("该冲突已因顺序或状态变化失效，请按当前全片叙事链重新检查")
         if plan["proposed_by"] == reviewer_id:
             raise DomainError("提案人不能审核自己的方案")
-        shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (plan["shot_id"],)).fetchone()
+        shot = self.conn.execute(
+            "SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?",
+            (plan["shot_id"],),
+        ).fetchone()
         if shot["status"] == "locked":
             raise DomainError("目标镜头已锁定")
         with self.transaction():
@@ -436,8 +536,13 @@ class ContinuityDB:
                     "UPDATE conflicts SET active=0,status='resolved',updated_at=? WHERE id=?",
                     (datetime.now().isoformat(), plan["conflict_id"]),
                 )
-                self._sync_conflicts(shot["scene_id"])
-        return {"plan_id": plan_id, "status": status, "conflicts": self.list_conflicts(shot["scene_id"])}
+                self._sync_production(shot["production_id"])
+        return {
+            "plan_id": plan_id,
+            "status": status,
+            "conflicts": self.list_conflicts(shot["scene_id"]),
+            "production_conflicts": self.list_production_conflicts(shot["production_id"]),
+        }
 
     def approve_exemption(self, conflict_id: int, reason: str, reviewer_id: int) -> int:
         reviewer = self.conn.execute("SELECT role FROM users WHERE id=?", (reviewer_id,)).fetchone()
@@ -465,29 +570,167 @@ class ContinuityDB:
         if user["role"] not in {"producer", "continuity"}:
             raise DomainError("无权锁定镜头")
         with self.transaction():
-            self._sync_conflicts(shot["scene_id"])
+            self._sync_production(shot["production_id"])
             blocking = self.conn.execute(
-                "SELECT COUNT(*) FROM conflicts WHERE scene_id=? AND active=1 AND status!='exempted'", (shot["scene_id"],)
+                "SELECT COUNT(*) FROM conflicts WHERE active=1 AND status!='exempted' "
+                "AND (scene_id=? OR from_shot_id=?)",
+                (shot["scene_id"], shot_id),
             ).fetchone()[0]
             if blocking:
-                raise DomainError(f"场次仍有 {blocking} 个未处理冲突，不能锁定")
+                raise DomainError(f"全片叙事链上仍有 {blocking} 个未处理冲突（含跨场次），不能锁定")
             self.conn.execute("UPDATE shots SET status='locked',version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
+
+    def reorder_scene(self, scene_id: int, narrative_order: int, user_id: int) -> dict:
+        """调整场次叙事顺序，随后全片重检；旧位置上的冲突指纹会自动失效，不再挂错位置。"""
+        scene = self.conn.execute("SELECT * FROM scenes WHERE id=?", (scene_id,)).fetchone()
+        if not scene:
+            raise DomainError("场次不存在")
+        user = self._production_for_user(scene["production_id"], user_id)
+        if user["role"] not in {"producer", "continuity"}:
+            raise DomainError("无权调整场次顺序")
+        if narrative_order <= 0:
+            raise DomainError("叙事顺序必须大于 0")
+        with self.transaction():
+            other = self.conn.execute(
+                "SELECT id FROM scenes WHERE production_id=? AND narrative_order=? AND id<>?",
+                (scene["production_id"], narrative_order, scene_id),
+            ).fetchone()
+            if other:  # 与占用该顺序的场次交换（用未占用的大值中转，绕开同事务唯一约束）
+                gap = self.conn.execute(
+                    "SELECT MAX(narrative_order)+1 FROM scenes WHERE production_id=?",
+                    (scene["production_id"],),
+                ).fetchone()[0]
+                self.conn.execute(
+                    "UPDATE scenes SET narrative_order=? WHERE id=?", (gap, other["id"])
+                )
+                self.conn.execute(
+                    "UPDATE scenes SET narrative_order=? WHERE id=?", (narrative_order, scene_id)
+                )
+                self.conn.execute(
+                    "UPDATE scenes SET narrative_order=? WHERE id=?",
+                    (scene["narrative_order"], other["id"]),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE scenes SET narrative_order=? WHERE id=?", (narrative_order, scene_id)
+                )
+            self._sync_production(scene["production_id"])
+        return {"scene_id": scene_id, "conflicts": self.list_production_conflicts(scene["production_id"])}
+
+    def reorder_shot(self, shot_id: int, narrative_order: int, user_id: int) -> dict:
+        """调整镜头在场次内的叙事顺序并全片重检。"""
+        shot = self.conn.execute(
+            "SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?",
+            (shot_id,),
+        ).fetchone()
+        if not shot:
+            raise DomainError("镜头不存在")
+        user = self._production_for_user(shot["production_id"], user_id)
+        if user["role"] not in {"producer", "continuity"}:
+            raise DomainError("无权调整镜头顺序")
+        if narrative_order <= 0:
+            raise DomainError("叙事顺序必须大于 0")
+        with self.transaction():
+            other = self.conn.execute(
+                "SELECT id FROM shots WHERE scene_id=? AND narrative_order=? AND id<>?",
+                (shot["scene_id"], narrative_order, shot_id),
+            ).fetchone()
+            if other:  # 与占用该顺序的镜头交换（用未占用大值中转）
+                gap = self.conn.execute(
+                    "SELECT MAX(narrative_order)+1 FROM shots WHERE scene_id=?",
+                    (shot["scene_id"],),
+                ).fetchone()[0]
+                self.conn.execute(
+                    "UPDATE shots SET narrative_order=?,updated_by=?,updated_at=? WHERE id=?",
+                    (gap, user_id, datetime.now().isoformat(), other["id"]),
+                )
+                self.conn.execute(
+                    "UPDATE shots SET narrative_order=?,updated_by=?,updated_at=? WHERE id=?",
+                    (narrative_order, user_id, datetime.now().isoformat(), shot_id),
+                )
+                self.conn.execute(
+                    "UPDATE shots SET narrative_order=?,updated_by=?,updated_at=? WHERE id=?",
+                    (shot["narrative_order"], user_id, datetime.now().isoformat(), other["id"]),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE shots SET narrative_order=?,updated_by=?,updated_at=? WHERE id=?",
+                    (narrative_order, user_id, datetime.now().isoformat(), shot_id),
+                )
+            self._sync_production(shot["production_id"])
+        return {"shot_id": shot_id, "conflicts": self.list_production_conflicts(shot["production_id"])}
+
+    def _effective_chain(self, production_id: int) -> list[dict]:
+        """计算每个镜头的有效状态：未写新状态时继承上一镜最近状态（仅展示，不入库）。"""
+        shots = self._narrative_chain(production_id)
+        elements = self.conn.execute(
+            "SELECT * FROM elements WHERE production_id=? ORDER BY id", (production_id,)
+        ).fetchall()
+        states = {
+            (r["shot_id"], r["element_id"]): dict(r)
+            for r in self.conn.execute(
+                "SELECT st.* FROM element_states st JOIN shots sh ON sh.id=st.shot_id JOIN scenes sc ON sc.id=sh.scene_id "
+                "WHERE sc.production_id=?", (production_id,)
+            ).fetchall()
+        }
+        carry: dict[int, dict] = {}  # element_id -> 最近显式状态
+        chain: list[dict] = []
+        for shot in shots:
+            entry = {k: shot[k] for k in shot.keys()}
+            effective = []
+            for element in elements:
+                explicit = states.get((shot["id"], element["id"]))
+                if explicit:
+                    source = "explicit"
+                    value = explicit
+                    carry[element["id"]] = explicit
+                elif element["id"] in carry:
+                    source = "inherited"
+                    value = carry[element["id"]]
+                else:
+                    continue
+                effective.append({
+                    "element_id": element["id"],
+                    "element_name": element["name"],
+                    "kind": element["kind"],
+                    "rule": element["rule"],
+                    "source": source,
+                    "source_shot_id": value["shot_id"],
+                    "state_value": value["state_value"],
+                    "numeric_value": value["numeric_value"],
+                    "note": value["note"],
+                })
+            entry["states"] = effective
+            chain.append(entry)
+        return chain
 
     def continuity_report(self, production_id: int) -> dict:
         production = self.conn.execute("SELECT * FROM productions WHERE id=?", (production_id,)).fetchone()
         if not production:
             raise DomainError("项目不存在")
+        with self.transaction():
+            self._sync_production(production_id)
+        all_conflicts = self.list_production_conflicts(production_id, include_resolved=True)
+        cross_conflicts = self.list_production_conflicts(production_id, cross_scene=True)
+        chain = self._effective_chain(production_id)
+        by_scene: dict[int, list[dict]] = {}
+        for entry in chain:
+            by_scene.setdefault(entry["scene_id"], []).append(entry)
         scenes = []
-        for scene in self.conn.execute("SELECT * FROM scenes WHERE production_id=? ORDER BY narrative_order", (production_id,)).fetchall():
-            shots = [dict(r) for r in self.conn.execute("SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene["id"],))]
-            conflicts = self.list_conflicts(scene["id"], include_resolved=True)
-            scenes.append({**dict(scene), "shots": shots, "conflicts": conflicts})
+        for scene in self.conn.execute(
+            "SELECT * FROM scenes WHERE production_id=? ORDER BY narrative_order", (production_id,)
+        ).fetchall():
+            scene_conflicts = [c for c in all_conflicts if c["scene_id"] == scene["id"]]
+            scenes.append({**dict(scene), "shots": by_scene.get(scene["id"], []), "conflicts": scene_conflicts})
+        active = [c for c in all_conflicts if c["active"]]
         return {
             "production": dict(production),
             "elements": [dict(r) for r in self.conn.execute("SELECT * FROM elements WHERE production_id=? ORDER BY id", (production_id,))],
+            "narrative_chain": chain,
+            "cross_scene_conflicts": cross_conflicts,
             "scenes": scenes,
-            "open_conflicts": sum(1 for scene in scenes for c in scene["conflicts"] if c["active"] and c["status"] == "open"),
-            "exempted_conflicts": sum(1 for scene in scenes for c in scene["conflicts"] if c["active"] and c["status"] == "exempted"),
+            "open_conflicts": sum(1 for c in active if c["status"] == "open"),
+            "exempted_conflicts": sum(1 for c in active if c["status"] == "exempted"),
         }
 
     def snapshot(self) -> dict:
